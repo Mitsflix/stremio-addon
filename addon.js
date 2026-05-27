@@ -1,6 +1,9 @@
 const { addonBuilder } = require('stremio-addon-sdk');
 const axios = require('axios');
 
+// ─── Real-Debrid ──────────────────────────────────────────
+const RD_API_KEY = process.env.RD_API_KEY || '';
+
 // ─── API Mirrors ─────────────────────────────────────────
 const YTS_MIRRORS = [
     'https://yts.torrentbay.st',
@@ -16,12 +19,13 @@ const TPB_MIRRORS = [
     { url: 'https://tpbay.win', type: 'html' },
     { url: 'https://tpb.party', type: 'html' }
 ];
+
 // ─── Manifest ────────────────────────────────────────────
 const manifest = {
     id: 'com.render.torrent.stream',
-    version: '3.5.40',
+    version: '3.5.41',
     name: 'Torrent to weblink',
-    description: 'Auto-rotating Scrapers | Multi-Format Series Search | 4K HDR',
+    description: 'Auto-rotating Scrapers | Multi-Format Series Search | 4K HDR | Real-Debrid',
     logo: 'https://stremio.eletroclay.com/logo.png',
     types: ['movie', 'series'],
     resources: ['stream'],
@@ -42,7 +46,6 @@ function getBaseUrl() {
         const [user, name] = process.env.SPACE_ID.toLowerCase().split('/');
         return `https://${user}-${name.replace(/\//g, '-')}.hf.space`;
     }
-    // If we're on local/VPS but no env var, provide a fallback (port 7860 for HF)
     const port = process.env.PORT || 3000;
     return `http://localhost:${port}`;
 }
@@ -72,13 +75,89 @@ const USER_AGENTS = [
 function getAxiosOpts() {
     return {
         timeout: 10000,
-        maxContentLength: 5 * 1024 * 1024, // 5MB Limit per request to prevent RAM spikes
+        maxContentLength: 5 * 1024 * 1024,
         headers: {
             'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
             'Accept': 'application/json, text/html',
             'Referer': 'https://www.google.com/',
         }
     };
+}
+
+// ─── Real-Debrid: Unrestrict a magnet/hash → direct URL ──
+async function rdUnrestrict(hash) {
+    if (!RD_API_KEY) return null;
+    try {
+        // Step 1: Add magnet to RD
+        const magnet = `magnet:?xt=urn:btih:${hash}`;
+        const addRes = await axios.post(
+            'https://api.real-debrid.com/rest/1.0/torrents/addMagnet',
+            `magnet=${encodeURIComponent(magnet)}`,
+            {
+                headers: {
+                    'Authorization': `Bearer ${RD_API_KEY}`,
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                timeout: 10000,
+            }
+        );
+        const torrentId = addRes.data?.id;
+        if (!torrentId) return null;
+
+        // Step 2: Select all files
+        await axios.post(
+            `https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${torrentId}`,
+            'files=all',
+            {
+                headers: {
+                    'Authorization': `Bearer ${RD_API_KEY}`,
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                timeout: 10000,
+            }
+        );
+
+        // Step 3: Poll for download links (max 15s)
+        for (let i = 0; i < 6; i++) {
+            await new Promise(r => setTimeout(r, 2500));
+            const infoRes = await axios.get(
+                `https://api.real-debrid.com/rest/1.0/torrents/info/${torrentId}`,
+                { headers: { 'Authorization': `Bearer ${RD_API_KEY}` }, timeout: 10000 }
+            );
+            const links = infoRes.data?.links || [];
+            if (links.length > 0) {
+                // Step 4: Unrestrict the link
+                const unrestrictRes = await axios.post(
+                    'https://api.real-debrid.com/rest/1.0/unrestrict/link',
+                    `link=${encodeURIComponent(links[0])}`,
+                    {
+                        headers: {
+                            'Authorization': `Bearer ${RD_API_KEY}`,
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                        },
+                        timeout: 10000,
+                    }
+                );
+                const directUrl = unrestrictRes.data?.download;
+                if (directUrl) {
+                    console.log(`[RD] ✓ Direct URL for ${hash.substring(0, 8)}`);
+                    // Clean up torrent from RD
+                    axios.delete(`https://api.real-debrid.com/rest/1.0/torrents/delete/${torrentId}`, {
+                        headers: { 'Authorization': `Bearer ${RD_API_KEY}` }
+                    }).catch(() => {});
+                    return directUrl;
+                }
+            }
+        }
+        // Clean up if failed
+        axios.delete(`https://api.real-debrid.com/rest/1.0/torrents/delete/${torrentId}`, {
+            headers: { 'Authorization': `Bearer ${RD_API_KEY}` }
+        }).catch(() => {});
+        return null;
+    } catch (e) {
+        console.error(`[RD] Error: ${e.message}`);
+        return null;
+    }
 }
 
 // ─── Cinemeta: get title metadata ────────────────────────
@@ -97,11 +176,8 @@ async function getMeta(imdbId, type = 'movie') {
     return null;
 }
 
-// ═══════════════════════════════════════════════════════════
-// ───  MOVIE SOURCES  ── (6 sources for movies)
-// ═══════════════════════════════════════════════════════════
+// ─── Movie Sources ────────────────────────────────────────
 
-// 1. YTS IMDB Lookup (best quality, cloud-friendly ✅)
 async function ytsImdbLookup(imdbId) {
     for (const mirror of YTS_MIRRORS) {
         try {
@@ -126,21 +202,17 @@ async function ytsImdbLookup(imdbId) {
     return [];
 }
 
-// 2. YTS Title Search (fallback for newer movies, cloud-friendly ✅)
 async function ytsSearch(title, year) {
     try {
         const url = `${YTS_MIRRORS[0]}/api/v2/list_movies.json?query_term=${encodeURIComponent(title)}&limit=10&sort_by=seeds`;
         const r = await axios.get(url, getAxiosOpts());
         const movies = r.data?.data?.movies;
         if (!movies?.length) return [];
-
-        // Find best year match
         let best = movies[0];
         if (year) {
             const match = movies.find(m => String(m.year) === String(year));
             if (match) best = match;
         }
-
         if (!best.torrents?.length) return [];
         console.log(`[YTS-Search] ✓ "${best.title}" (${best.year}) — ${best.torrents.length} torrents`);
         return best.torrents.map(t => ({
@@ -156,14 +228,12 @@ async function ytsSearch(title, year) {
     } catch (e) { console.error(`[YTS-Search] ${e.message}`); return []; }
 }
 
-// 3. Hydra Scraper: TPB API + HTML Proxy support
 async function tpbSearch(q, category = '201,207,208') {
     for (const mirror of TPB_MIRRORS) {
         try {
             const isApi = mirror.type === 'api';
             const url = isApi ? `${mirror.url}/q.php?q=${encodeURIComponent(q)}&cat=${category}` : `${mirror.url}/search/${encodeURIComponent(q)}/1/99/${category}`;
             const r = await axios.get(url, { ...getAxiosOpts(), timeout: 8000 });
-
             if (isApi) {
                 const results = Array.isArray(r.data) ? r.data : [];
                 const filtered = results.filter(t => t.info_hash && t.info_hash !== '0000000000000000000000000000000000000000');
@@ -180,7 +250,6 @@ async function tpbSearch(q, category = '201,207,208') {
                 const html = r.data || '';
                 const magnets = html.match(/magnet:\?xt=urn:btih:([a-zA-Z0-9]{32,40})/gi) || [];
                 if (!magnets.length) continue;
-                console.log(`[TPB-HTML] ✓ ${magnets.length} results via ${mirror.url}`);
                 return magnets.slice(0, 30).map(m => ({
                     hash: m.split('btih:')[1].toLowerCase(),
                     title: q,
@@ -193,7 +262,6 @@ async function tpbSearch(q, category = '201,207,208') {
     return [];
 }
 
-// 4. EZTV Search (Mirror Rotation)
 async function eztvSearch(imdbId, s, e) {
     if (!imdbId) return [];
     const id = imdbId.replace('tt', '');
@@ -203,13 +271,11 @@ async function eztvSearch(imdbId, s, e) {
             const r = await axios.get(url, getAxiosOpts());
             const torrents = r.data?.torrents || [];
             if (!torrents.length) continue;
-
             const filtered = torrents.filter(t =>
                 String(t.season) === String(parseInt(s)) &&
                 String(t.episode) === String(parseInt(e))
             );
             if (!filtered.length) continue;
-
             console.log(`[EZTV] ✓ ${filtered.length} results via ${mirror}`);
             return filtered.map(t => ({
                 hash: t.hash?.toLowerCase(),
@@ -223,7 +289,6 @@ async function eztvSearch(imdbId, s, e) {
     return [];
 }
 
-// 4.6 SolidTorrents (Mirror Rotation)
 async function solidTorrentsSearch(q) {
     const mirrors = ['https://solidtorrents.to', 'https://solidtorrents.eu', 'https://solidtorrents.net'];
     for (const mirror of mirrors) {
@@ -245,13 +310,12 @@ async function solidTorrentsSearch(q) {
     return [];
 }
 
-// 4.65 BTDig Search (replaces TorrentGalaxy which is DNS-blocked on Render)
 async function btDigSearch(q) {
     const mirrors = ['https://btdig.com', 'https://btdigg.xyz'];
     for (const mirror of mirrors) {
         try {
             const url = `${mirror}/search?q=${encodeURIComponent(q)}&p=0&order=0`;
-            const r = await axios.get(url, { ...getAxiosOpts(), timeout: 8000, headers: { ...getAxiosOpts().headers, 'User-Agent': 'Mozilla/5.0' } });
+            const r = await axios.get(url, { ...getAxiosOpts(), timeout: 8000 });
             const html = r.data || '';
             const magnets = html.match(/magnet:\?xt=urn:btih:([a-zA-Z0-9]{32,40})/gi) || [];
             const hashes = [...new Set(magnets.map(m => m.split('btih:')[1].toLowerCase()))];
@@ -263,15 +327,12 @@ async function btDigSearch(q) {
     return [];
 }
 
-// 4.7 Nyaa RSS Search (Direct Anime Scraper)
 async function nyaaRssSearch(q) {
     try {
         const url = `https://nyaa.si/?page=rss&q=${encodeURIComponent(q)}&c=1_0&f=0`;
         const r = await axios.get(url, { ...getAxiosOpts(), timeout: 8000 });
         const items = r.data.match(/<item>[\s\S]*?<\/item>/g) || [];
         if (!items.length) return [];
-
-        console.log(`[Nyaa-RSS] ✓ ${items.length} titles found for ${q}`);
         return items.map(item => {
             const title = item.match(/<title>([\s\S]*?)<\/title>/)?.[1] || 'Unknown';
             const hash = item.match(/<nyaa:infoHash>([\s\S]*?)<\/nyaa:infoHash>/)?.[1]?.toLowerCase();
@@ -282,34 +343,24 @@ async function nyaaRssSearch(q) {
     } catch (e) { return []; }
 }
 
-// 4.8 Bitsearch Direct Scraper
 async function bitsearchSearch(q) {
     try {
         const url = `https://bitsearch.to/search?q=${encodeURIComponent(q)}`;
         const r = await axios.get(url, { ...getAxiosOpts(), timeout: 10000 });
         const html = r.data || '';
-
-        // Find magnets in HTML (Base32 or Hex)
         const magnets = html.match(/magnet:\?xt=urn:btih:[a-zA-Z0-9]{32,40}/gi) || [];
         const hashes = magnets.map(m => m.split('btih:')[1].toLowerCase());
-
         if (!hashes.length) return [];
-        console.log(`[Bitsearch] ✓ ${hashes.length} hashes found for ${q}`);
-
         return [...new Set(hashes)].slice(0, 25).map(h => ({
-            hash: h,
-            title: `${q} - Bitsearch`,
-            source: 'Bitsearch',
-            seeds: 5, // Estimate
+            hash: h, title: `${q} - Bitsearch`, source: 'Bitsearch', seeds: 5,
         }));
     } catch (e) { return []; }
 }
 
-// 4.5 TPB IMDB Lookup (Powerful for Indian & Niche content)
 async function tpbImdbLookup(imdbId) {
     for (const mirror of TPB_MIRRORS) {
         try {
-            if (mirror.type !== 'api') continue; // Only API supports direct IMDB query reliably
+            if (mirror.type !== 'api') continue;
             const url = `${mirror.url}/q.php?q=${imdbId}&cat=0`;
             const r = await axios.get(url, getAxiosOpts());
             const results = (r.data || []).filter(t =>
@@ -317,7 +368,6 @@ async function tpbImdbLookup(imdbId) {
                 t.name !== 'No results returned'
             );
             if (!results.length) continue;
-
             console.log(`[TPB-IMDB] ✓ ${results.length} results via ${mirror.url}`);
             return results.map(r => ({
                 hash: r.info_hash?.toLowerCase(),
@@ -331,15 +381,16 @@ async function tpbImdbLookup(imdbId) {
     return [];
 }
 
-// ═══════════════════════════════════════════════════════════
-// ───  META SOURCES (Torrentio as scraper)
-// ═══════════════════════════════════════════════════════════
-
-// 5. Torrentio Scraper (Primary source for 1337x, RARBG, TorrentGalaxy, etc)
+// ─── Torrentio Scraper ────────────────────────────────────
 async function fetchTorrentio(type, id) {
-    // Try Official Torrentio first, then TorrentsDB mirror
+    // Use RD if available for instant direct URLs
+    const rdKey = RD_API_KEY;
+    const torrentioBase = rdKey
+        ? `https://torrentio.strem.fun/debridoptions=nocatalog|realdebrid=${rdKey}`
+        : 'https://torrentio.strem.fun';
+
     const baseUrls = [
-        'https://torrentio.strem.fun',
+        torrentioBase,
         'https://torrentsdb.com',
         'https://torrentio.viren070.me'
     ];
@@ -347,33 +398,38 @@ async function fetchTorrentio(type, id) {
     for (const baseUrl of baseUrls) {
         try {
             const url = `${baseUrl}/stream/${type}/${id}.json`;
-            const r = await axios.get(url, { ...getAxiosOpts(), timeout: 6000 });
+            const r = await axios.get(url, { ...getAxiosOpts(), timeout: 10000 });
             const streams = r.data?.streams || [];
             if (!streams.length) continue;
 
-            console.log(`[Torrentio-${baseUrl.includes('strem.fun') ? 'Official' : 'Mirror'}] ✓ ${streams.length} streams`);
+            console.log(`[Torrentio] ✓ ${streams.length} streams (RD: ${!!rdKey})`);
+
+            // If RD is active, streams have direct URLs — return them directly
+            if (rdKey) {
+                return streams
+                    .filter(s => s.url) // RD streams have direct URLs
+                    .map(s => ({
+                        directUrl: s.url, // direct playable URL from RD
+                        hash: s.infoHash?.toLowerCase(),
+                        title: s.title?.split('\n').slice(0, 2).join(' | ') || s.name,
+                        quality: parseQuality(s.name + ' ' + s.title),
+                        size: s.title?.match(/💾\s*([^👥👤\n]+)/)?.[1]?.trim() || '',
+                        seeds: parseInt(s.title?.match(/[👤👥]\s*(\d+)/)?.[1] || '0'),
+                        source: 'Torrentio+RD',
+                        isRD: true,
+                    }));
+            }
+
+            // No RD — return hashes for server-side streaming
             return streams.map(s => {
                 const lines = s.title ? s.title.split('\n') : [];
-                const qualityMatch = s.name?.match(/(?:Torrentio|TorrentsDB)\s+(.+)/i);
-                const quality = qualityMatch ? qualityMatch[1] : '?';
-
-                let size = '';
-                let seeds = 0;
-                const sizeMatch = s.title?.match(/💾\s*([^👥👤\n]+)/);
-                if (sizeMatch) size = sizeMatch[1].trim();
-                const seedsMatch = s.title?.match(/[👤👥]\s*(\d+)/);
-                if (seedsMatch) seeds = parseInt(seedsMatch[1]);
-
-                const title = lines.length > 2 ? lines[2].trim() : lines.join(' ');
-                const source = lines.length > 0 ? `Tio ${lines[0].trim()}` : 'Torrentio';
-
                 return {
                     hash: s.infoHash?.toLowerCase(),
-                    title: title,
-                    quality: quality,
-                    size: size,
-                    seeds: seeds,
-                    source: source,
+                    title: lines.length > 2 ? lines[2].trim() : lines.join(' '),
+                    quality: parseQuality(s.name + ' ' + s.title),
+                    size: s.title?.match(/💾\s*([^👥👤\n]+)/)?.[1]?.trim() || '',
+                    seeds: parseInt(s.title?.match(/[👤👥]\s*(\d+)/)?.[1] || '0'),
+                    source: lines.length > 0 ? `Tio ${lines[0].trim()}` : 'Torrentio',
                 };
             }).filter(t => t.hash);
         } catch (e) { continue; }
@@ -381,61 +437,32 @@ async function fetchTorrentio(type, id) {
     return [];
 }
 
-// 6. Generic Stremio Addon Fetcher (Proxy to TPB+, Comet, etc)
 async function fetchStremioAddon(sourceName, baseUrl, type, id) {
     try {
         const url = `${baseUrl}/stream/${type}/${id}.json`;
         const r = await axios.get(url, { ...getAxiosOpts(), timeout: 8000 });
         const streams = r.data?.streams || [];
         if (!streams.length) return [];
-
         console.log(`[${sourceName}] ✓ ${streams.length} streams`);
         return streams.map(s => {
             const quality = parseQuality(s.name + ' ' + s.title);
-            let seeds = 0;
-            const seedsMatch = s.title?.match(/👤\s*(\d+)/i) || s.name?.match(/👤\s*(\d+)/i);
-            if (seedsMatch) seeds = parseInt(seedsMatch[1]);
-
-            let size = '';
-            const sizeMatch = s.title?.match(/💾\s*([^👥\n]+)/) || s.name?.match(/💾\s*([^👥\n]+)/);
-            if (sizeMatch) size = sizeMatch[1].trim();
-
-            const title = s.title?.split('\n')[0] || s.name || sourceName;
-
+            const seeds = parseInt(s.title?.match(/👤\s*(\d+)/i)?.[1] || '0');
+            const size = s.title?.match(/💾\s*([^👥\n]+)/)?.[1]?.trim() || '';
             return {
                 hash: s.infoHash?.toLowerCase(),
-                title: title,
-                quality: quality,
-                size: size,
-                seeds: seeds,
+                title: s.title?.split('\n')[0] || s.name || sourceName,
+                quality, size, seeds,
                 source: sourceName,
             };
         }).filter(t => t.hash);
-    } catch (e) {
-        console.error(`[${sourceName} Error] ${e.message}`);
-        return [];
-    }
+    } catch (e) { return []; }
 }
-
 
 // ─── Dedup + Build Streams ───────────────────────────────
 const QUALITY_RANKS = {
-    '2160P': 7,
-    '4K': 7,
-    'UHD': 7,
-    '1080P': 6,
-    '720P': 5,
-    '480P': 4,
-    'BDRIP': 3,
-    'HDRIP': 3,
-    'WEBRIP': 3,
-    'WEB-DL': 3,
-    'BLURAY': 3,
-    'HDTV': 3,
-    '?': 1,
-    'CAM': 0,
-    'TS': 0,
-    'TELESYNC': 0
+    '2160P': 7, '4K': 7, 'UHD': 7, '1080P': 6, '720P': 5, '480P': 4,
+    'BDRIP': 3, 'HDRIP': 3, 'WEBRIP': 3, 'WEB-DL': 3, 'BLURAY': 3, 'HDTV': 3,
+    '?': 1, 'CAM': 0, 'TS': 0, 'TELESYNC': 0
 };
 
 function getQualityRank(qualityStr) {
@@ -450,63 +477,56 @@ function getQualityRank(qualityStr) {
 function buildStreams(torrents, baseUrl) {
     const streams = [];
 
-    // 1. Group by hash to combine sources & find max seeders
+    // Separate RD direct streams — they go first, no dedup needed
+    const rdStreams = torrents.filter(t => t.isRD && t.directUrl);
+    const torrentStreams = torrents.filter(t => !t.isRD);
+
+    // Add RD streams first (instant playback)
+    for (const t of rdStreams) {
+        const quality = t.quality || parseQuality(t.title);
+        let info = '';
+        if (t.size) info += t.size;
+        if (t.seeds) info += info ? ` | 👤 ${t.seeds}` : `👤 ${t.seeds}`;
+        streams.push({
+            url: t.directUrl,
+            title: `⚡ ${quality} | ${info || 'RD Direct'}\n${t.title} | ${t.source}`,
+            behaviorHints: { bingeGroup: `rd-${quality}`, notWebReady: false },
+        });
+    }
+
+    // Dedup torrent streams by hash
     const deduplicated = new Map();
-    for (const t of torrents) {
+    for (const t of torrentStreams) {
         if (!t.hash) continue;
         const hash = t.hash.toLowerCase();
-
         if (deduplicated.has(hash)) {
             const existing = deduplicated.get(hash);
-            // Combine source labels (e.g., 'YTS + Tio 1337x')
-            if (!existing.source.includes(t.source)) {
-                existing.source += ` + ${t.source}`;
-            }
-            // Keep the maximum reported seeders
+            if (!existing.source.includes(t.source)) existing.source += ` + ${t.source}`;
             existing.seeds = Math.max(existing.seeds || 0, t.seeds || 0);
-
-            // Prefer more descriptive titles
-            if (t.title && t.title.length > (existing.title?.length || 0)) {
-                existing.title = t.title;
-            }
+            if (t.title && t.title.length > (existing.title?.length || 0)) existing.title = t.title;
         } else {
-            // Copy to avoid mutating original
             deduplicated.set(hash, { ...t, hash });
         }
     }
 
-    const uniqueTorrents = Array.from(deduplicated.values());
-
-    // 2. Sort by resolution (highest first), then seeders (most first)
-    uniqueTorrents.sort((a, b) => {
-        const qA = a.quality || parseQuality(a.title);
-        const qB = b.quality || parseQuality(b.title);
-        const rankA = getQualityRank(qA);
-        const rankB = getQualityRank(qB);
-
-        if (rankA !== rankB) {
-            return rankB - rankA;
-        }
+    const uniqueTorrents = Array.from(deduplicated.values()).sort((a, b) => {
+        const rankA = getQualityRank(a.quality || parseQuality(a.title));
+        const rankB = getQualityRank(b.quality || parseQuality(b.title));
+        if (rankA !== rankB) return rankB - rankA;
         return (b.seeds || 0) - (a.seeds || 0);
     });
 
-    // 3. Optional: Map ALL uniquely combined results into final streams (No limits, no hard filters)
     for (const t of uniqueTorrents) {
         const quality = t.quality || parseQuality(t.title);
         let info = '';
-        if (t.codec) info += `${t.codec}`;
+        if (t.codec) info += t.codec;
         if (t.audio) info += info ? ` ${t.audio}ch` : `${t.audio}ch`;
-        if (t.size) info += info ? ` | ${t.size}` : `${t.size}`;
+        if (t.size) info += info ? ` | ${t.size}` : t.size;
         info += info ? ` | 👤 ${t.seeds}` : `👤 ${t.seeds}`;
-
-        // Lead with Resolution (Quality) 🖥️
         streams.push({
             url: `${baseUrl}/stream/${t.hash}`,
             title: `🖥️ ${quality} | ${info}\n${t.title} | ${t.source}`,
-            behaviorHints: {
-                bingeGroup: `render-proxy-${quality}`,
-                notWebReady: true,
-            },
+            behaviorHints: { bingeGroup: `render-proxy-${quality}`, notWebReady: true },
         });
     }
 
@@ -515,20 +535,12 @@ function buildStreams(torrents, baseUrl) {
 
 // ─── Stream Handler ──────────────────────────────────────
 builder.defineStreamHandler(async ({ type, id }) => {
-    console.log(`\n[Stream] type=${type} id=${id}`);
+    console.log(`\n[Stream] type=${type} id=${id} RD:${!!RD_API_KEY}`);
     const baseUrl = getBaseUrl();
 
     try {
         if (type === 'movie') {
-            // Fire ALL sources simultaneously — do NOT wait for YTS before starting others
-            // This restores the 40+ results we had in v3.4.x
-            const [
-                meta,
-                ytsResults,
-                torrentioResults,
-                tpbPlusResults,
-                tpbImdbResults,
-            ] = await Promise.all([
+            const [meta, ytsResults, torrentioResults, tpbPlusResults, tpbImdbResults] = await Promise.all([
                 getMeta(id, 'movie').catch(() => null),
                 ytsImdbLookup(id).catch(() => []),
                 fetchTorrentio('movie', id).catch(() => []),
@@ -536,24 +548,16 @@ builder.defineStreamHandler(async ({ type, id }) => {
                 tpbImdbLookup(id).catch(() => []),
             ]);
 
-            const allTorrents = [
-                ...ytsResults,
-                ...torrentioResults,
-                ...tpbPlusResults,
-                ...tpbImdbResults,
-            ];
+            const allTorrents = [...ytsResults, ...torrentioResults, ...tpbPlusResults, ...tpbImdbResults];
 
-            // Reduced Wave 1.5 (More stable sources)
             const backupResults = await Promise.all([
                 fetchStremioAddon('Comet', 'https://comet.elfhosted.com/indexers=torrentio', 'movie', id).catch(() => []),
                 fetchStremioAddon('MediaFusion-Indian', 'https://mediafusion.elfhosted.com/indexers=tamilblasters%7Ctamilmv%7Conlinemoviesgold%7Ctorrentio', 'movie', id).catch(() => []),
             ]);
             for (const r of backupResults) allTorrents.push(...r);
 
-            // Small 100ms pause to let GC breathe before Title Wave
             await new Promise(resolve => setTimeout(resolve, 100));
 
-            // Title-based searches (needs metadata, run in second parallel wave)
             if (meta?.name) {
                 const titleResults = await Promise.allSettled([
                     ytsSearch(meta.name, meta.year),
@@ -569,13 +573,10 @@ builder.defineStreamHandler(async ({ type, id }) => {
                 }
             }
 
-            if (allTorrents.length === 0) {
-                console.log('[Stream] No movie torrents found from any source');
-                return { streams: [] };
-            }
+            if (allTorrents.length === 0) return { streams: [] };
 
             const streams = buildStreams(allTorrents, baseUrl);
-            console.log(`[Stream] → ${streams.length} movie streams (${allTorrents.length} raw hits joined)`);
+            console.log(`[Stream] → ${streams.length} streams (RD direct: ${streams.filter(s => s.title?.startsWith('⚡')).length})`);
             return { streams };
 
         } else if (type === 'series') {
@@ -584,11 +585,9 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
             const meta = await getMeta(imdbId, 'series');
             const showName = meta?.name;
-
             const sHex = season.padStart(2, '0');
             const eHex = episode.padStart(2, '0');
             const sShort = season.replace(/^0/, '');
-            const eShort = episode.replace(/^0/, '');
 
             const sources1 = await Promise.allSettled([
                 eztvSearch(imdbId, season, episode),
@@ -602,8 +601,8 @@ builder.defineStreamHandler(async ({ type, id }) => {
                 if (s.status === 'fulfilled' && s.value.length > 0) allTorrents.push(...s.value);
             }
 
-            // Wave 1.5 + Small pause
             await new Promise(resolve => setTimeout(resolve, 100));
+
             const sources2 = await Promise.allSettled([
                 fetchStremioAddon('MediaFusion-Indian', 'https://mediafusion.elfhosted.com/indexers=tamilblasters%7Ctamilmv%7Conlinemoviesgold%7Ctorrentio', 'series', id),
                 solidTorrentsSearch(`${showName} S${sHex}E${eHex}`),
@@ -613,8 +612,8 @@ builder.defineStreamHandler(async ({ type, id }) => {
                 if (s.status === 'fulfilled' && s.value.length > 0) allTorrents.push(...s.value);
             }
 
-            // Final Wave (Titles)
             await new Promise(resolve => setTimeout(resolve, 100));
+
             const sources3 = await Promise.allSettled([
                 btDigSearch(`${showName} S${sHex}E${eHex}`),
                 bitsearchSearch(`${showName} S${sHex}E${eHex}`),
@@ -625,13 +624,10 @@ builder.defineStreamHandler(async ({ type, id }) => {
                 if (s.status === 'fulfilled' && s.value.length > 0) allTorrents.push(...s.value);
             }
 
-            if (allTorrents.length === 0) {
-                console.log(`[Stream] No series torrents found for ${showName || imdbId} S${season}E${episode}`);
-                return { streams: [] };
-            }
+            if (allTorrents.length === 0) return { streams: [] };
 
             const streams = buildStreams(allTorrents, baseUrl);
-            console.log(`[Stream] → ${streams.length} series streams (${allTorrents.length} raw hits joined)`);
+            console.log(`[Stream] → ${streams.length} streams (RD direct: ${streams.filter(s => s.title?.startsWith('⚡')).length})`);
             return { streams };
         }
 
