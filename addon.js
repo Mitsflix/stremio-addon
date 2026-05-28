@@ -458,6 +458,79 @@ async function fetchStremioAddon(sourceName, baseUrl, type, id) {
     } catch (e) { return []; }
 }
 
+
+// ─── 1337x Scraper ──────────────────────────────────────
+async function search1337x(q) {
+    const mirrors = ['https://1337x.to', 'https://1337x.st', 'https://1337x.gd'];
+    for (const mirror of mirrors) {
+        try {
+            const url = `${mirror}/search/${encodeURIComponent(q)}/1/`;
+            const r = await axios.get(url, { ...getAxiosOpts(), timeout: 8000 });
+            const html = r.data || '';
+            const magnets = html.match(/magnet:\?xt=urn:btih:[a-zA-Z0-9]{32,40}/gi) || [];
+            const hashes = [...new Set(magnets.map(m => m.split('btih:')[1].toLowerCase()))];
+            if (!hashes.length) continue;
+            console.log(`[1337x] ✓ ${hashes.length} results via ${mirror}`);
+            return hashes.slice(0, 20).map(h => ({ hash: h, title: q, source: '1337x', seeds: 5 }));
+        } catch (e) { continue; }
+    }
+    return [];
+}
+
+// ─── RARBG Mirror Scraper ────────────────────────────────
+async function rarbgSearch(imdbId) {
+    const mirrors = ['https://rargb.to', 'https://rarbg.to/'];
+    for (const mirror of mirrors) {
+        try {
+            const url = `${mirror}/torrents.php?imdb=${imdbId}&category[]=movies&category[]=tv`;
+            const r = await axios.get(url, { ...getAxiosOpts(), timeout: 8000 });
+            const html = r.data || '';
+            const magnets = html.match(/magnet:\?xt=urn:btih:[a-zA-Z0-9]{32,40}/gi) || [];
+            const hashes = [...new Set(magnets.map(m => m.split('btih:')[1].toLowerCase()))];
+            if (!hashes.length) continue;
+            return hashes.slice(0, 15).map(h => ({ hash: h, title: imdbId, source: 'RARBG', seeds: 10 }));
+        } catch { continue; }
+    }
+    return [];
+}
+
+// ─── TorrentGalaxy Scraper ───────────────────────────────
+async function torrentGalaxySearch(q) {
+    const mirrors = ['https://torrentgalaxy.to', 'https://tgx.rs'];
+    for (const mirror of mirrors) {
+        try {
+            const url = `${mirror}/torrents.php?search=${encodeURIComponent(q)}&sort=seeders&order=desc`;
+            const r = await axios.get(url, { ...getAxiosOpts(), timeout: 8000 });
+            const html = r.data || '';
+            const magnets = html.match(/magnet:\?xt=urn:btih:[a-zA-Z0-9]{32,40}/gi) || [];
+            const hashes = [...new Set(magnets.map(m => m.split('btih:')[1].toLowerCase()))];
+            if (!hashes.length) continue;
+            console.log(`[TGX] ✓ ${hashes.length} results`);
+            return hashes.slice(0, 20).map(h => ({ hash: h, title: q, source: 'TorrentGalaxy', seeds: 5 }));
+        } catch { continue; }
+    }
+    return [];
+}
+
+// ─── Sports/UFC specific search ──────────────────────────
+async function sportsTorrentSearch(q) {
+    const results = [];
+    // SportVideoHub and similar
+    const sportMirrors = [
+        `https://www.mmatorrents.com/?s=${encodeURIComponent(q)}`,
+    ];
+    for (const url of sportMirrors) {
+        try {
+            const r = await axios.get(url, { ...getAxiosOpts(), timeout: 8000 });
+            const html = r.data || '';
+            const magnets = html.match(/magnet:\?xt=urn:btih:[a-zA-Z0-9]{32,40}/gi) || [];
+            const hashes = [...new Set(magnets.map(m => m.split('btih:')[1].toLowerCase()))];
+            hashes.slice(0, 10).forEach(h => results.push({ hash: h, title: q, source: 'SportsTorrent', seeds: 5 }));
+        } catch { continue; }
+    }
+    return results;
+}
+
 // ─── Dedup + Build Streams ───────────────────────────────
 const QUALITY_RANKS = {
     '2160P': 7, '4K': 7, 'UHD': 7, '1080P': 6, '720P': 5, '480P': 4,
@@ -567,6 +640,9 @@ builder.defineStreamHandler(async ({ type, id }) => {
                     btDigSearch(meta.name + ' ' + (meta.year || '')),
                     bitsearchSearch(meta.name + ' ' + (meta.year || '')),
                     nyaaRssSearch(meta.name),
+                    search1337x(meta.name + ' ' + (meta.year || '')),
+                    torrentGalaxySearch(meta.name + ' ' + (meta.year || '')),
+                    rarbgSearch(id),
                 ]);
                 for (const r of titleResults) {
                     if (r.status === 'fulfilled' && Array.isArray(r.value)) allTorrents.push(...r.value);
@@ -619,6 +695,9 @@ builder.defineStreamHandler(async ({ type, id }) => {
                 bitsearchSearch(`${showName} S${sHex}E${eHex}`),
                 nyaaRssSearch(showName),
                 showName ? tpbSearch(`${showName} S${sHex}E${eHex}`, '208') : Promise.resolve([]),
+                showName ? search1337x(`${showName} S${sHex}E${eHex}`) : Promise.resolve([]),
+                showName ? torrentGalaxySearch(`${showName} S${sHex}E${eHex}`) : Promise.resolve([]),
+                showName ? sportsTorrentSearch(showName) : Promise.resolve([]),
             ]);
             for (const s of sources3) {
                 if (s.status === 'fulfilled' && s.value.length > 0) allTorrents.push(...s.value);
